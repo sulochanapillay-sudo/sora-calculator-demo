@@ -1,0 +1,6 @@
+{
+  "name": "Singapore SORA Calculator",
+  "description": "Institutional-grade Singapore SORA calculator reading MAS overnight interest rates for precision loan calculations, amortization, and TDSR stress testing.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
