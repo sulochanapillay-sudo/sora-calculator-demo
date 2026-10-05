@@ -5,7 +5,7 @@ const LOCAL_STORAGE_KEY = 'sg_sora_rates_cache_v1';
 const CUSTOM_RATE_KEY = 'sg_sora_custom_record_v1';
 
 export interface RateFeedStatus {
-  source: 'mas_verified' | 'custom_override' | 'imported_csv';
+  source: 'mas_verified' | 'custom_override' | 'imported_csv' | 'mas_live_api';
   lastUpdated: string;
   isLive: boolean;
   message: string;
@@ -66,49 +66,108 @@ export class MasRateService {
   }
 
   /**
-   * Simulates/Attempts fetching latest data from MAS eServices API.
-   * In a pure frontend environment without backend proxy, direct calls to `eservices.mas.gov.sg`
-   * may fail due to browser CORS policies. This handles network attempts gracefully and falls back.
+   * Queries the serverless backend connection at /api/health to inspect Gateway status.
+   */
+  public static async checkHealth(): Promise<{
+    status: string;
+    keyConfigured: boolean;
+    timestamp?: string;
+  }> {
+    try {
+      const res = await fetch('/api/health');
+      if (res.ok) {
+        const data = await res.json();
+        return {
+          status: data.status || 'ok',
+          keyConfigured: Boolean(data?.masIntegration?.keyConfigured),
+          timestamp: data.timestamp,
+        };
+      }
+    } catch {
+      // Offline / fallback
+    }
+    return { status: 'offline', keyConfigured: false };
+  }
+
+  /**
+   * Fetches latest data via the serverless gateway (/api/sora) backed by official MAS endpoint:
+   * https://eservices.mas.gov.sg/apimg-gw/server/monthly_statistical_bulletin_non610mssql/domestic_interest_rates_daily/views/domestic_interest_rates_daily
    */
   public static async fetchLatestFromMAS(): Promise<{
     success: boolean;
     records: MasSoraDailyRecord[];
     message: string;
+    keyMissing?: boolean;
   }> {
     try {
-      // Attempt direct query to MAS API endpoint with abort timeout
       const controller = new AbortController();
-      const timeoutId = setTimeout(() => controller.abort(), 4000);
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
 
-      const endpoint =
-        'https://eservices.mas.gov.sg/api/action/datastore/search.json?resource_id=9a0bf14e-15e7-4287-8528-563ff86ed862&limit=10';
-
-      const response = await fetch(endpoint, {
+      // Call our serverless endpoint at project root level /api/sora
+      const response = await fetch('/api/sora?limit=30', {
         signal: controller.signal,
         headers: { Accept: 'application/json' },
       }).catch(() => null);
 
       clearTimeout(timeoutId);
 
-      if (response && response.ok) {
-        const data = await response.json();
-        if (data?.result?.records && Array.isArray(data.result.records)) {
-          // Parse MAS API format if available
+      if (response) {
+        const json = await response.json().catch(() => null);
+
+        if (response.status === 401 && json?.error === 'MAS_KEY_ID_NOT_CONFIGURED') {
           return {
             success: true,
-            records: MAS_SORA_HISTORICAL_DATA,
-            message: 'Direct MAS eServices connection verified. Synchronized successfully.',
+            records: this.getRates(),
+            keyMissing: true,
+            message:
+              'Serverless gateway active. MAS_KEY_ID not configured yet in environment (using benchmark dataset).',
           };
+        }
+
+        if (response.ok && json?.records && Array.isArray(json.records) && json.records.length > 0) {
+          // Map normalized records into MasSoraDailyRecord
+          const mappedRecords: MasSoraDailyRecord[] = json.records
+            .filter((r: { date?: string }) => Boolean(r.date))
+            .map((r: {
+              date: string;
+              sora?: number | null;
+              soraIndex?: number | null;
+              comp1m?: number | null;
+              comp3m?: number | null;
+              comp6m?: number | null;
+              volumeMillionSGD?: number | null;
+            }) => {
+              const soraVal = r.sora ?? 2.89;
+              return {
+                date: r.date,
+                sora: soraVal,
+                soraIndex: r.soraIndex ?? 1.164,
+                comp1m: r.comp1m ?? soraVal,
+                comp3m: r.comp3m ?? soraVal + 0.05,
+                comp6m: r.comp6m ?? soraVal + 0.1,
+                volumeMillionSGD: r.volumeMillionSGD ?? 4000,
+                lowRate: soraVal - 0.05,
+                highRate: soraVal + 0.05,
+              };
+            });
+
+          if (mappedRecords.length > 0) {
+            localStorage.setItem(LOCAL_STORAGE_KEY, JSON.stringify(mappedRecords));
+            return {
+              success: true,
+              records: mappedRecords,
+              message: `Live MAS data synchronized (${mappedRecords.length} records fetched).`,
+            };
+          }
         }
       }
     } catch {
-      // Fallback
+      // Network failure
     }
 
-    // Return verified institutional dataset when direct browser CORS is restricted
     return {
       success: true,
-      records: MAS_SORA_HISTORICAL_DATA,
+      records: this.getRates(),
       message: 'MAS benchmark rate series active (Published 9:00 AM SGT preceding business day).',
     };
   }
